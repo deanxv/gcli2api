@@ -21,6 +21,7 @@ from config import (
     get_retry_429_max_retries,
     get_retry_429_enabled,
     get_retry_429_interval,
+    get_retryable_error_codes,
     PUBLIC_API_MODELS
 )
 from .httpx_client import http_client, create_streaming_client_with_kwargs
@@ -93,19 +94,20 @@ async def _prepare_request_headers_and_payload(payload: dict, credential_data: d
 async def send_gemini_request(payload: dict, is_streaming: bool = False, credential_manager: CredentialManager = None) -> Response:
     """
     Send a request to Google's Gemini API.
-    
+
     Args:
         payload: The request payload in Gemini format
         is_streaming: Whether this is a streaming request
         credential_manager: CredentialManager instance
-        
+
     Returns:
         FastAPI Response object
     """
-    # 获取429重试配置
+    # 获取重试配置
     max_retries = await get_retry_429_max_retries()
     retry_429_enabled = await get_retry_429_enabled()
     retry_interval = await get_retry_429_interval()
+    retryable_error_codes = await get_retryable_error_codes()
     
     # 动态确定API端点和payload格式
     model_name = payload.get("model", "")
@@ -145,25 +147,26 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
                     # 使用stream方法但不在async with块中消费数据
                     stream_ctx = client.stream("POST", target_url, content=final_post_data, headers=headers)
                     resp = await stream_ctx.__aenter__()
-                    
-                    if resp.status_code == 429:
-                        # 记录429错误并获取响应内容
+
+                    # 检查是否是需要重试的错误码
+                    if resp.status_code in retryable_error_codes and resp.status_code != 200:
+                        # 记录错误并获取响应内容
                         response_content = ""
                         try:
                             content_bytes = await resp.aread()
                             if isinstance(content_bytes, bytes):
                                 response_content = content_bytes.decode('utf-8', errors='ignore')
                         except Exception as e:
-                            log.debug(f"[STREAMING] Failed to read 429 response content: {e}")
-                        
-                        # 显示详细的429错误信息
+                            log.debug(f"[STREAMING] Failed to read {resp.status_code} response content: {e}")
+
+                        # 显示详细的错误信息
                         if response_content:
-                            log.error(f"Google API returned status 429 (STREAMING). Response details: {response_content[:500]}")
+                            log.error(f"Google API returned status {resp.status_code} (STREAMING). Response details: {response_content[:500]}")
                         else:
-                            log.error("Google API returned status 429 (STREAMING) - quota exhausted, no response details available")
-                        
+                            log.error(f"Google API returned status {resp.status_code} (STREAMING) - no response details available")
+
                         if credential_manager and current_file:
-                            await credential_manager.record_api_call_result(current_file, False, 429)
+                            await credential_manager.record_api_call_result(current_file, False, resp.status_code)
                         
                         # 清理资源
                         try:
@@ -171,12 +174,12 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
                         except:
                             pass
                         await client.aclose()
-                        
+
                         # 如果重试可用且未达到最大次数，进行重试
                         if retry_429_enabled and attempt < max_retries:
-                            log.warning(f"[RETRY] 429 error encountered, retrying ({attempt + 1}/{max_retries})")
+                            log.warning(f"[RETRY] {resp.status_code} error encountered, retrying ({attempt + 1}/{max_retries})")
                             if credential_manager:
-                                # 429错误时强制轮换凭证，不增加调用计数
+                                # 错误时强制轮换凭证，不增加调用计数
                                 await credential_manager.force_rotate_credential()
                                 # 重新获取凭证和headers（凭证可能已轮换）
                                 new_credential_result = await credential_manager.get_valid_credential()
@@ -184,20 +187,33 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
                                     current_file, credential_data = new_credential_result
                                     headers, updated_payload, target_url = await _prepare_request_headers_and_payload(payload, credential_data, use_public_api, target_url)
                                     final_post_data = json.dumps(updated_payload)
+                                else:
+                                    # 没有更多可用凭证
+                                    log.error(f"No more credentials available after {resp.status_code} error")
+                                    async def error_stream():
+                                        error_response = {
+                                            "error": {
+                                                "message": f"All credentials failed with {resp.status_code}",
+                                                "type": "api_error",
+                                                "code": resp.status_code
+                                            }
+                                        }
+                                        yield f"data: {json.dumps(error_response)}\n\n"
+                                    return StreamingResponse(error_stream(), media_type="text/event-stream", status_code=resp.status_code)
                             await asyncio.sleep(retry_interval)
                             continue  # 跳出内层处理，继续外层循环重试
                         else:
-                            # 返回429错误流
+                            # 返回错误流
                             async def error_stream():
                                 error_response = {
                                     "error": {
-                                        "message": "429 rate limit exceeded, max retries reached",
+                                        "message": f"{resp.status_code} error, max retries reached",
                                         "type": "api_error",
-                                        "code": 429
+                                        "code": resp.status_code
                                     }
                                 }
                                 yield f"data: {json.dumps(error_response)}\n\n"
-                            return StreamingResponse(error_stream(), media_type="text/event-stream", status_code=429)
+                            return StreamingResponse(error_stream(), media_type="text/event-stream", status_code=resp.status_code)
                     elif resp.status_code != 200:
                         # 处理其他非200状态码的错误
                         response_content = ""
@@ -257,17 +273,18 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
                     resp = await client.post(
                         target_url, content=final_post_data, headers=headers
                     )
-                    
-                    if resp.status_code == 429:
-                        # 记录429错误
+
+                    # 检查是否是需要重试的错误码
+                    if resp.status_code in retryable_error_codes and resp.status_code != 200:
+                        # 记录错误
                         if credential_manager and current_file:
-                            await credential_manager.record_api_call_result(current_file, False, 429)
-                        
+                            await credential_manager.record_api_call_result(current_file, False, resp.status_code)
+
                         # 如果重试可用且未达到最大次数，继续重试
                         if retry_429_enabled and attempt < max_retries:
-                            log.warning(f"[RETRY] 429 error encountered, retrying ({attempt + 1}/{max_retries})")
+                            log.warning(f"[RETRY] {resp.status_code} error encountered, retrying ({attempt + 1}/{max_retries})")
                             if credential_manager:
-                                # 429错误时强制轮换凭证，不增加调用计数
+                                # 错误时强制轮换凭证，不增加调用计数
                                 await credential_manager.force_rotate_credential()
                                 # 重新获取凭证和headers（凭证可能已轮换）
                                 new_credential_result = await credential_manager.get_valid_credential()
@@ -275,13 +292,17 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
                                     current_file, credential_data = new_credential_result
                                     headers, updated_payload, target_url = await _prepare_request_headers_and_payload(payload, credential_data, use_public_api, target_url)
                                     final_post_data = json.dumps(updated_payload)
+                                else:
+                                    # 没有更多可用凭证
+                                    log.error(f"No more credentials available after {resp.status_code} error")
+                                    return _create_error_response(f"All credentials failed with {resp.status_code}", resp.status_code)
                             await asyncio.sleep(retry_interval)
                             continue
                         else:
-                            log.error(f"[RETRY] Max retries exceeded for 429 error")
-                            return _create_error_response("429 rate limit exceeded, max retries reached", 429)
+                            log.error(f"[RETRY] Max retries exceeded for {resp.status_code} error")
+                            return _create_error_response(f"{resp.status_code} error, max retries reached", resp.status_code)
                     else:
-                        # 非429错误或成功响应，正常处理
+                        # 非重试错误或成功响应，正常处理
                         return await _handle_non_streaming_response(resp, credential_manager, payload.get("model", ""), current_file)
                     
         except Exception as e:
@@ -292,9 +313,9 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
             else:
                 log.error(f"Request to Google API failed: {str(e)}")
                 return _create_error_response(f"Request failed: {str(e)}")
-    
+
     # 如果循环结束仍未成功，返回错误
-    return _create_error_response("Max retries exceeded", 429)
+    return _create_error_response("Max retries exceeded, all credentials failed", 500)
 
 
 def _handle_streaming_response_managed(resp, stream_ctx, client, credential_manager: CredentialManager = None, model_name: str = "", current_file: str = None) -> StreamingResponse:

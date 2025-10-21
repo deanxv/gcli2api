@@ -10,6 +10,9 @@ from typing import Any, Optional
 # 需要自动封禁的错误码 (默认值，可通过环境变量或配置覆盖)
 AUTO_BAN_ERROR_CODES = [401, 403]
 
+# 需要重试的错误码（会尝试所有可用凭证）
+RETRYABLE_ERROR_CODES = [401, 403, 429]
+
 # Default Safety Settings for Google API
 DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -162,8 +165,30 @@ async def get_retry_429_interval() -> float:
             return float(env_value)
         except ValueError:
             pass
-    
+
     return float(await get_config_value("retry_429_interval", 1))
+
+async def get_retryable_error_codes() -> list:
+    """Get list of error codes that should trigger credential rotation and retry."""
+    env_value = os.getenv("RETRYABLE_ERROR_CODES")
+    if env_value:
+        try:
+            # Parse comma-separated list of error codes
+            return [int(code.strip()) for code in env_value.split(",")]
+        except ValueError:
+            pass
+
+    config_value = await get_config_value("retryable_error_codes")
+    if config_value:
+        if isinstance(config_value, list):
+            return config_value
+        elif isinstance(config_value, str):
+            try:
+                return [int(code.strip()) for code in config_value.split(",")]
+            except ValueError:
+                pass
+
+    return RETRYABLE_ERROR_CODES
 
 
 # Model name lists for different features
